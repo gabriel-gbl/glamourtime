@@ -2,9 +2,8 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\Appointment;
-use App\Models\AvailableSlot;
-use App\Models\User;
+use App\Services\AppointmentService;
+use App\Services\AvailableSlotService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Inertia\Inertia;
@@ -12,6 +11,17 @@ use Inertia\Response;
 
 class ClientController extends Controller
 {
+    protected AppointmentService $appointmentService;
+    protected AvailableSlotService $slotService;
+
+    public function __construct(
+        AppointmentService $appointmentService,
+        AvailableSlotService $slotService
+    ) {
+        $this->appointmentService = $appointmentService;
+        $this->slotService = $slotService;
+    }
+
     public function dashboard(): Response
     {
         return Inertia::render('Client/Dashboard');
@@ -23,16 +33,13 @@ class ClientController extends Controller
         $remarcarAgendamento = null;
 
         if ($remarcarId) {
-            $remarcarAgendamento = Appointment::where('id', $remarcarId)
-                ->where('user_id', Auth::id())
-                ->whereIn('status', ['pendente', 'confirmado'])
-                ->first();
+            $remarcarAgendamento = $this->appointmentService->appointmentRepository->getById($remarcarId);
+            if (!$remarcarAgendamento || $remarcarAgendamento->user_id !== Auth::id()) {
+                $remarcarAgendamento = null;
+            }
         }
 
-        $slots = AvailableSlot::where('is_booked', false)
-            ->orderBy('date')
-            ->orderBy('time')
-            ->get();
+        $slots = $this->slotService->getAvailableSlots();
 
         return Inertia::render('Client/Agendar', [
             'horariosDisponiveis' => $slots,
@@ -45,77 +52,46 @@ class ClientController extends Controller
         $request->validate([
             'servico' => ['required', 'string', 'max:255'],
             'horarioEscolhido' => ['required', 'string'],
-            'id' => ['nullable', 'integer'], // ID of appointment being rescheduled
+            'id' => ['nullable', 'integer'],
         ]);
 
-        // horarioEscolhido is sent as "date|time"
-        $parts = explode('|', $request->horarioEscolhido);
-        if (count($parts) !== 2) {
-            return back()->withErrors(['horarioEscolhido' => 'Horário inválido.']);
-        }
-        $date = $parts[0];
-        $time = $parts[1];
-
-        // Verify if new slot is indeed free
-        $newSlot = AvailableSlot::where('date', $date)
-            ->where('time', $time)
-            ->where('is_booked', false)
-            ->first();
-
-        if (!$newSlot) {
-            return back()->withErrors(['horarioEscolhido' => 'Este horário não está mais disponível.']);
-        }
-
-        if ($request->id) {
-            // Rescheduling
-            $appointment = Appointment::where('id', $request->id)
-                ->where('user_id', Auth::id())
-                ->first();
-
-            if (!$appointment) {
-                return back()->withErrors(['error' => 'Agendamento não encontrado.']);
+        try {
+            // horarioEscolhido is sent as "date|time"
+            $parts = explode('|', $request->horarioEscolhido);
+            if (count($parts) !== 2) {
+                return back()->withErrors(['horarioEscolhido' => 'Horário inválido.']);
             }
+            $date = $parts[0];
+            $time = $parts[1];
 
-            // Free the old slot
-            AvailableSlot::where('date', $appointment->date)
-                ->where('time', $appointment->time)
-                ->update(['is_booked' => false]);
-
-            // Book the new slot
-            $newSlot->update(['is_booked' => true]);
-
-            // Update appointment
-            $appointment->update([
-                'service' => $request->servico,
-                'date' => $date,
-                'time' => substr($time, 0, 5),
-                'status' => 'pendente', // Reset status to pending when rescheduled
-            ]);
-
-            return redirect()->route('client.agendamento')->with('success', 'Agendamento reagendado com sucesso!');
-        } else {
-            // New scheduling
-            // Book the new slot
-            $newSlot->update(['is_booked' => true]);
-
-            Appointment::create([
-                'user_id' => Auth::id(),
-                'service' => $request->servico,
-                'date' => $date,
-                'time' => substr($time, 0, 5),
-                'status' => 'pendente',
-            ]);
-
-            return redirect()->route('client.agendamento')->with('success', 'Agendamento realizado com sucesso!');
+            if ($request->id) {
+                // Rescheduling
+                $this->appointmentService->rescheduleAppointment(
+                    $request->id,
+                    Auth::id(),
+                    $request->servico,
+                    $date,
+                    $time
+                );
+                return redirect()->route('client.agendamento')->with('success', 'Agendamento reagendado com sucesso!');
+            } else {
+                // New scheduling
+                $this->appointmentService->createAppointment(
+                    Auth::id(),
+                    $request->servico,
+                    $date,
+                    $time
+                );
+                return redirect()->route('client.agendamento')->with('success', 'Agendamento realizado com sucesso!');
+            }
+        } catch (\Exception $e) {
+            return back()->withErrors(['error' => $e->getMessage()]);
         }
     }
 
     public function showConsultForm(): Response
     {
-        $slots = AvailableSlot::where('is_booked', false)
-            ->orderBy('date')
-            ->orderBy('time')
-            ->get();
+        $slots = $this->slotService->getAvailableSlots();
 
         return Inertia::render('Client/Consultar', [
             'horarios' => $slots,
@@ -130,36 +106,22 @@ class ClientController extends Controller
             'servico' => ['required', 'string'],
         ]);
 
-        $slot = AvailableSlot::where('date', $request->data)
-            ->where('time', $request->hora)
-            ->where('is_booked', false)
-            ->first();
-
-        if (!$slot) {
-            return back()->withErrors(['error' => 'Horário indisponível.']);
+        try {
+            $this->appointmentService->createAppointment(
+                Auth::id(),
+                $request->servico,
+                $request->data,
+                $request->hora
+            );
+            return redirect()->route('client.agendamento')->with('success', 'Agendamento realizado com sucesso!');
+        } catch (\Exception $e) {
+            return back()->withErrors(['error' => $e->getMessage()]);
         }
-
-        $slot->update(['is_booked' => true]);
-
-        Appointment::create([
-            'user_id' => Auth::id(),
-            'service' => $request->servico,
-            'date' => $request->data,
-            'time' => substr($request->hora, 0, 5),
-            'status' => 'pendente',
-        ]);
-
-        return redirect()->route('client.agendamento')->with('success', 'Agendamento realizado com sucesso!');
     }
 
     public function showActiveAppointment(): Response
     {
-        // Get the active pending/confirmed appointment
-        $appointment = Appointment::where('user_id', Auth::id())
-            ->whereIn('status', ['pendente', 'confirmado'])
-            ->orderBy('date')
-            ->orderBy('time')
-            ->first();
+        $appointment = $this->appointmentService->getActiveAppointment(Auth::id());
 
         return Inertia::render('Client/Agendamento', [
             'agendamento' => $appointment,
@@ -168,20 +130,12 @@ class ClientController extends Controller
 
     public function cancelAppointment($id)
     {
-        $appointment = Appointment::where('id', $id)
-            ->where('user_id', Auth::id())
-            ->whereIn('status', ['pendente', 'confirmado'])
-            ->firstOrFail();
-
-        // Free the slot
-        AvailableSlot::where('date', $appointment->date)
-            ->where('time', $appointment->time)
-            ->update(['is_booked' => false]);
-
-        // Cancel the appointment
-        $appointment->update(['status' => 'cancelado']);
-
-        return redirect()->route('client.agendamento')->with('success', 'Agendamento cancelado com sucesso.');
+        try {
+            $this->appointmentService->cancelAppointment($id, Auth::id());
+            return redirect()->route('client.agendamento')->with('success', 'Agendamento cancelado com sucesso.');
+        } catch (\Exception $e) {
+            return back()->withErrors(['error' => $e->getMessage()]);
+        }
     }
 
     public function showProfile(): Response
@@ -197,7 +151,7 @@ class ClientController extends Controller
             'telefone' => ['nullable', 'string', 'max:20'],
         ]);
 
-        /** @var User $user */
+        /** @var \App\Models\User $user */
         $user = Auth::user();
         $user->update([
             'name' => $request->nome,
@@ -210,7 +164,7 @@ class ClientController extends Controller
 
     public function deleteAccount(Request $request)
     {
-        /** @var User $user */
+        /** @var \App\Models\User $user */
         $user = Auth::user();
         Auth::logout();
 

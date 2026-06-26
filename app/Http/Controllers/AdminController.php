@@ -2,9 +2,8 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\Appointment;
-use App\Models\AvailableSlot;
-use App\Models\User;
+use App\Services\AppointmentService;
+use App\Services\AvailableSlotService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Inertia\Inertia;
@@ -12,13 +11,24 @@ use Inertia\Response;
 
 class AdminController extends Controller
 {
+    protected AppointmentService $appointmentService;
+    protected AvailableSlotService $slotService;
+
+    public function __construct(
+        AppointmentService $appointmentService,
+        AvailableSlotService $slotService
+    ) {
+        $this->appointmentService = $appointmentService;
+        $this->slotService = $slotService;
+    }
+
     public function dashboard(): Response
     {
-        $appointments = Appointment::all();
+        $appointments = $this->appointmentService->appointmentRepository->getAll();
 
         $totalPendentes = $appointments->where('status', 'pendente')->count();
         $totalConcluidos = $appointments->where('status', 'concluido')->count();
-        
+
         $valorServico = 40;
         $receitaTotal = $totalConcluidos * $valorServico;
 
@@ -31,69 +41,54 @@ class AdminController extends Controller
 
     public function manageAppointments(): Response
     {
-        $appointments = Appointment::with('user')->orderBy('date')->orderBy('time')->get();
-
-        $pendentes = $appointments->where('status', 'pendente')->values();
-        $confirmados = $appointments->where('status', 'confirmado')->values();
-        $concluidos = $appointments->where('status', 'concluido')->values();
-        $cancelados = $appointments->where('status', 'cancelado')->values();
+        $appointmentsByStatus = $this->appointmentService->getAppointmentsByStatus();
 
         return Inertia::render('Admin/Gerenciar', [
-            'pendentes' => $pendentes,
-            'confirmados' => $confirmados,
-            'concluidos' => $concluidos,
-            'cancelados' => $cancelados,
+            'pendentes' => $appointmentsByStatus['pendentes'],
+            'confirmados' => $appointmentsByStatus['confirmados'],
+            'concluidos' => $appointmentsByStatus['concluidos'],
+            'cancelados' => $appointmentsByStatus['cancelados'],
         ]);
     }
 
     public function confirmAppointment($id)
     {
-        $appointment = Appointment::findOrFail($id);
-        $appointment->update(['status' => 'confirmado']);
-
-        return redirect()->back()->with('success', 'Agendamento confirmado com sucesso!');
+        try {
+            $this->appointmentService->confirmAppointment($id);
+            return redirect()->back()->with('success', 'Agendamento confirmado com sucesso!');
+        } catch (\Exception $e) {
+            return back()->withErrors(['error' => $e->getMessage()]);
+        }
     }
 
     public function rejectAppointment($id)
     {
-        $appointment = Appointment::findOrFail($id);
-        
-        // Free the slot
-        AvailableSlot::where('date', $appointment->date)
-            ->where('time', $appointment->time)
-            ->update(['is_booked' => false]);
-
-        $appointment->update(['status' => 'cancelado']);
-
-        return redirect()->back()->with('success', 'Agendamento rejeitado.');
+        try {
+            $this->appointmentService->rejectAppointment($id);
+            return redirect()->back()->with('success', 'Agendamento rejeitado.');
+        } catch (\Exception $e) {
+            return back()->withErrors(['error' => $e->getMessage()]);
+        }
     }
 
     public function completeAppointment($id)
     {
-        $appointment = Appointment::findOrFail($id);
-        $appointment->update(['status' => 'concluido']);
-
-        // Award loyalty points to the client
-        $client = $appointment->user;
-        if ($client) {
-            $client->increment('points', 100);
+        try {
+            $this->appointmentService->completeAppointment($id);
+            return redirect()->back()->with('success', 'Atendimento concluído com sucesso!');
+        } catch (\Exception $e) {
+            return back()->withErrors(['error' => $e->getMessage()]);
         }
-
-        return redirect()->back()->with('success', 'Atendimento concluído com sucesso!');
     }
 
     public function cancelConfirmedAppointment($id)
     {
-        $appointment = Appointment::findOrFail($id);
-
-        // Free the slot
-        AvailableSlot::where('date', $appointment->date)
-            ->where('time', $appointment->time)
-            ->update(['is_booked' => false]);
-
-        $appointment->update(['status' => 'cancelado']);
-
-        return redirect()->back()->with('success', 'Agendamento cancelado.');
+        try {
+            $this->appointmentService->rejectAppointment($id);
+            return redirect()->back()->with('success', 'Agendamento cancelado.');
+        } catch (\Exception $e) {
+            return back()->withErrors(['error' => $e->getMessage()]);
+        }
     }
 
     public function showCreateSlotForm(): Response
@@ -108,22 +103,12 @@ class AdminController extends Controller
             'hora' => ['required', 'string'],
         ]);
 
-        // Check if slot already exists
-        $exists = AvailableSlot::where('date', $request->data)
-            ->where('time', $request->hora)
-            ->exists();
-
-        if ($exists) {
-            return back()->withErrors(['hora' => 'Este horário já está cadastrado para este dia.']);
+        try {
+            $this->slotService->createSlot($request->data, $request->hora);
+            return redirect()->back()->with('success', 'Horário disponível adicionado com sucesso!');
+        } catch (\Exception $e) {
+            return back()->withErrors(['hora' => $e->getMessage()]);
         }
-
-        AvailableSlot::create([
-            'date' => $request->data,
-            'time' => $request->hora,
-            'is_booked' => false,
-        ]);
-
-        return redirect()->back()->with('success', 'Horário disponível adicionado com sucesso!');
     }
 
     public function showProfile(): Response
@@ -139,7 +124,7 @@ class AdminController extends Controller
             'telefone' => ['nullable', 'string', 'max:20'],
         ]);
 
-        /** @var User $user */
+        /** @var \App\Models\User $user */
         $user = Auth::user();
         $user->update([
             'name' => $request->nome,
